@@ -1,8 +1,11 @@
 import json
+from hashlib import sha256
 from datetime import datetime, timedelta, timezone
 from math import asin, cos, radians, sin, sqrt
+import time
 
 import requests
+from django.core.cache import cache
 from django.conf import settings
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
@@ -234,6 +237,10 @@ def hourly_value(times, values, target):
     return float(values[best] or 0)
 
 
+def weather_coordinate_key(lat, lon):
+    return f'{lat:.5f},{lon:.5f}'
+
+
 def weather_forecasts(points):
     # Open-Meteo accepts multiple coordinates in one request. Chunking prevents
     # excessively long URLs on long trips with 10-mile sampling.
@@ -243,21 +250,33 @@ def weather_forecasts(points):
         chunk = points[start:start + chunk_size]
         lats = ','.join(f"{p['coordinate'][1]:.5f}" for p in chunk)
         lons = ','.join(f"{p['coordinate'][0]:.5f}" for p in chunk)
-        r = requests.get(
-            settings.OPEN_METEO_URL,
-            params={
-                'latitude': lats,
-                'longitude': lons,
-                'hourly': 'wind_speed_10m,rain,snowfall',
-                'wind_speed_unit': 'mph',
-                'precipitation_unit': 'inch',
-                'forecast_days': 16,
-                'timezone': 'UTC',
-            },
-            timeout=30,
-        )
-        r.raise_for_status()
-        payload = r.json()
+        params = {
+            'latitude': lats,
+            'longitude': lons,
+            'hourly': 'wind_speed_10m,rain,snowfall',
+            'wind_speed_unit': 'mph',
+            'precipitation_unit': 'inch',
+            'forecast_days': 16,
+            'timezone': 'UTC',
+        }
+        cache_input = json.dumps([settings.OPEN_METEO_URL, params], sort_keys=True)
+        cache_key = f'weather_forecast:{sha256(cache_input.encode()).hexdigest()}'
+        payload = cache.get(cache_key)
+        if payload is None:
+            for attempt in range(4):
+                r = requests.get(settings.OPEN_METEO_URL, params=params, timeout=30)
+                if r.status_code != 429:
+                    break
+                if attempt == 3:
+                    r.raise_for_status()
+                try:
+                    delay = float(r.headers.get('Retry-After', 2 ** attempt))
+                except (TypeError, ValueError):
+                    delay = 2 ** attempt
+                time.sleep(min(max(delay, 0), 30))
+            r.raise_for_status()
+            payload = r.json()
+            cache.set(cache_key, payload, timeout=600)
         if isinstance(payload, dict):
             payload = [payload]
         if len(payload) != len(chunk):
@@ -276,21 +295,26 @@ def weather_values_at(weather, target):
     )
 
 
-def weather_batch(points, departure):
+def weather_batch(points, departure, forecasts_by_coordinate=None):
     results = []
-    for point, weather in weather_forecasts(points):
+    forecasts = weather_forecasts(points) if forecasts_by_coordinate is None else [
+        (point, forecasts_by_coordinate[weather_coordinate_key(point['coordinate'][1], point['coordinate'][0])])
+        for point in points
+    ]
+    for point, weather in forecasts:
         target = departure + timedelta(seconds=point['eta_offset_seconds'])
         wind, rain, snow = weather_values_at(weather, target)
         results.append((point, wind, rain, snow, target))
     return results
 
 
-def route_payload(route, route_index, departure, load, interval):
+def route_payload(route, route_index, departure, load, interval, checkpoint_points=None, forecasts_by_coordinate=None):
     coords = route['geometry']['coordinates']
     duration_s = float(route['duration'])
     distance_miles = float(route['distance']) / 1000 * MILES_PER_KM
-    checkpoints, _ = sample_checkpoints(coords, duration_s, interval)
-    weathered = weather_batch(checkpoints, departure)
+    if checkpoint_points is None:
+        checkpoint_points, _ = sample_checkpoints(coords, duration_s, interval)
+    weathered = weather_batch(checkpoint_points, departure, forecasts_by_coordinate)
     checkpoint_out = []
     for point, wind, rain, snow, eta in weathered:
         risk, reasons, breakdown = risk_for_weather(wind, rain, snow, load)
@@ -340,7 +364,7 @@ def route_payload(route, route_index, departure, load, interval):
     }
 
 
-def heatmap_payload(routes, departure):
+def heatmap_payload(routes, departure, forecasts_by_coordinate=None):
     # Use checkpoint coordinates from all routes and provide 0–48h weather slices.
     unique = {}
     for route in routes:
@@ -351,7 +375,10 @@ def heatmap_payload(routes, departure):
     if not points:
         return []
     # Heatmap should reflect forecast relative to departure, not route ETA.
-    forecasts = weather_forecasts(points)
+    forecasts = weather_forecasts(points) if forecasts_by_coordinate is None else [
+        (point, forecasts_by_coordinate[weather_coordinate_key(*unique[key])])
+        for key, point in zip(unique, points)
+    ]
     hourly_slices = []
     for hour in range(0, 49, 3):
         values = []
@@ -398,10 +425,29 @@ def plan_route(request):
         origin = geocode_place(origin_text)
         destination = geocode_place(destination_text)
         raw_routes = get_routes(origin, destination)
-        routes = [route_payload(r, i + 1, departure, load, interval) for i, r in enumerate(raw_routes)]
+        route_checkpoints = []
+        forecast_points = {}
+        for route in raw_routes:
+            checkpoints, _ = sample_checkpoints(
+                route['geometry']['coordinates'], float(route['duration']), interval
+            )
+            route_checkpoints.append(checkpoints)
+            for point in checkpoints:
+                lat, lon = point['coordinate'][1], point['coordinate'][0]
+                forecast_points.setdefault(weather_coordinate_key(lat, lon), point)
+        forecasts_by_coordinate = {
+            weather_coordinate_key(point['coordinate'][1], point['coordinate'][0]): weather
+            for point, weather in weather_forecasts(list(forecast_points.values()))
+        }
+        routes = [
+            route_payload(
+                route, i + 1, departure, load, interval, route_checkpoints[i], forecasts_by_coordinate
+            )
+            for i, route in enumerate(raw_routes)
+        ]
         # Recommendation exactly follows the brief's priority order.
         recommended = sorted(routes, key=lambda r: (r['severe_miles'], r['high_miles'], r['average_risk'], r['duration_minutes']))[0] if routes else None
-        heatmap = heatmap_payload(routes, departure)
+        heatmap = heatmap_payload(routes, departure, forecasts_by_coordinate)
         return JsonResponse({
             'origin': origin,
             'destination': destination,
